@@ -14,16 +14,15 @@ enable_profiler=false
 performance=true
 audit=false
 accuracy=false
-enable_xla_flags=false
 
-while getopts "ntspxdar:" opt
+
+while getopts "ntspdar:" opt
 do
   case "$opt" in
       n ) dry_run=true ;;
       t ) test_run=true ;; 
       s ) skip_warmup=true ;;
       p ) enable_profiler=true ;;
-      x ) enable_xla_flags=true ;;
       d ) audit=true ;;
       a ) accuracy=true ;;
       r ) run_name="$OPTARG" ;;
@@ -50,12 +49,6 @@ fi
 
 if [ -z "$TOKENIZER_PATH" ]; then
   TOKENIZER_PATH=/home/${USER}/maxtext/assets/tokenizer.llama2
-fi
-
-export LIBTPU_INIT_ARGS=""
-if "$enable_xla_flags"; then
-    TEST_FLAGS=$(python3 trillium/select_xla_flags.py)
-    export LIBTPU_INIT_ARGS=${TEST_FLAGS}
 fi
 
 BATCH_STR=""
@@ -96,6 +89,7 @@ fi
 # LIBTPU_INIT_ARGS="--xla_tpu_enable_data_parallel_all_reduce_opt=true --xla_tpu_data_parallel_opt_different_sized_ops=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true"
 # makes subsequent runs faster
 export JAX_COMPILATION_CACHE_DIR="/tmp/jax_cache2"
+export LIBTPU_INIT_ARGS
 
 run_loadgen() {
 
@@ -112,8 +106,6 @@ run_loadgen() {
   echo "USER_CONFIG: ${USER_CONFIG}"
   echo "BATCH_AND_PREFILL_LEN: ${BATCH_AND_PREFILL_LEN}"
   echo "MAXENGINE_ARGS: ${MAXENGINE_ARGS}"
-  echo "LIBTPU_INIT_ARGS:${LIBTPU_INIT_ARGS}"
-  echo "XLA_FLAGS:${XLA_FLAGS}"
 
   ${cmd} python -m offline_mode \
     --mlperf_test_mode=${TEST_MODE} \
