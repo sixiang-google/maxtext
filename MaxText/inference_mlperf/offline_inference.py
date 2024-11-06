@@ -68,9 +68,10 @@ class OfflineInference:
     self.dummy = False
 
     self._cached_pref = {}
+    self._cached_pref_batch = {}
     self._cached_generate = None
-    self.detokenize_backlog = queue.Queue(10)
-
+    self.detokenize_backlog = queue.Queue(12)
+    self.prefill_buckets = defaultdict(list)
   def init_decode_state(self):
     if self.decode_state is None:
       self.decode_state = self.engine.init_decode_state()
@@ -113,7 +114,18 @@ class OfflineInference:
     prefill_result, first_token = self.engine.prefill(params=params, padded_tokens=tokens, true_length=true_length)
     decode_state = self.engine.insert(prefill_result, decode_state, slot=slot)
     return first_token, decode_state
-
+  def _prefill_insert_batch(self, params, tokens, slots, true_lengths, decode_state):
+    """return decodestate."""
+    prefill_results, first_tokens = self.engine.prefill(
+      params = params, 
+      padded_tokens = tokens, 
+      true_length = true_length)
+    decode_state = jax.lax.fori_loop(
+      0, prefill_results.shape[0], 
+      lambda i, state: self.engine.insert(prefill_results[i], state, slot=slots[i]),
+      decode_state
+    )
+    return first_tokens, decode_state
   def batch_inference_with_callback(
       self,
       data: List[InputData],
@@ -126,21 +138,58 @@ class OfflineInference:
     token.
     """
 
-    def prefill(slot, tokens, true_length):
+    def prefill(prefill_bucket, prefill_len):
       nonlocal self
       if self.dummy:
         log.info("dummy prefill")
         return 123
-
-      prefill_fn = self._prefill_insert
-      if (cached := self._cached_pref.get(len(tokens))) is not None:
-        prefill_fn = cached
-
-      first_token, self.decode_state = prefill_fn(
-          self.params, tokens=tokens, slot=slot, true_length=true_length, decode_state=self.decode_state
-      )
-      return first_token
-
+      if prefill_len * len(prefill_bucket) != 1024:
+        prefill_result = []
+        prefill_fn = self._prefill_insert
+        if (cached := self._cached_pref.get(prefill_len)) is not None:
+          prefill_fn = cached
+        for (slot, row) in prefill_bucket:
+          first_token, self.decode_state = prefill_fn(
+            self.params, 
+            tokens=row.tokens, 
+            slot=slot, 
+            true_length=row.true_length,
+            decode_state=self.decode_state
+          )
+          prefill_result.append((first_token, slot, row))
+        return prefill_result
+      else:
+        prefill_fn = self._prefill_insert_batch
+        if (cached := self._cached_pref_batch.get(prefill_len)) is not None:
+          prefill_fn = cached
+        # start_pos = jnp.arange(0, 1024, prefill_len)
+        tokens = jnp.stack([row.tokens for (slot, row) in prefill_bucket])
+        slots = [slot for (slot, row) in prefill_bucket]
+        true_lengths = [row.true_length for (slot, row) in prefill_bucket]
+        first_tokens, self.decode_state = prefill_fn(
+          self.params, 
+          tokens=tokens, 
+          slots=slots, 
+          true_lengths=true_lengths,
+          decode_state=self.decode_state,
+          # start_pos = start_pos
+        )
+        prefill_result = []
+        for (idx, (slot, row)) in enumerate(prefill_bucket):
+          first_generated_token = jax.lax.slice_in_dim(first_tokens.data, idx, idx+1, axis = 0)
+          all_valid = jnp.ones(first_generated_token.shape, dtype=jnp.int8)
+          generated_tokens = jnp.zeros((1, 1), dtype=jnp.int32)
+          first_token = engine_api.ResultTokens(
+            data = jnp.concatenate((first_generated_token, all_valid, generated_tokens), axis=1),
+            tokens_idx=(0, 1),
+            valid_idx=(1, 2),
+            length_idx=(2, 3),
+            samples_per_slot=1,
+          )
+          prefill_result.append((first_token, slot, row))
+        return prefill_result
+          
+        
     empty_slots = list(range(self.batch_size))
     slot_to_id = {}
     num_prefills = {}
@@ -171,6 +220,7 @@ class OfflineInference:
           self.decode_state, result_tokens = gen_fn(self.params, self.decode_state)
           result_tokens_l.append(result_tokens)
       for i in range(5):
+        # result_tokens.copy_to_host_async()
         result_tokens = result_tokens_l[i].convert_to_numpy()
         self.detokenize_backlog.put((result_tokens, False, 0, 0), block = True)
         # log.info(f"Decode put result {i} to queue")
@@ -182,6 +232,7 @@ class OfflineInference:
         # log.info("Detokenize start")
         newly_empty = []
         result_tokens, is_first_token, row_id, _slot = self.detokenize_backlog.get(block=True)
+        # result_tokens = result_tokens.convert_to_numpy()
         # log.info("Detokenize get from queue")
         if is_first_token:
           first_token = result_tokens.data[0][0].item()
@@ -212,6 +263,7 @@ class OfflineInference:
     )
     self.live = True
     detokenize_thread.start()
+    num_prefill = 0
     for row in data:
       while not empty_slots:
         # If slots are all full, decode until there are free slots
@@ -221,14 +273,34 @@ class OfflineInference:
         decode()
       # do one insert
       num_tokens = len(row.tokens)
-      num_prefills[num_tokens] = 0 if num_tokens not in num_prefills else num_prefills[num_tokens] + 1
+      num_prefills[num_tokens] = 1 if num_tokens not in num_prefills else num_prefills[num_tokens] + 1
       log.info(
           f"prefill-{desc}-{num_prefills} num_prefills {sum(num_prefills.values())} num_tokens {num_tokens} true_length {row.true_length} num_empty_slots {len(empty_slots)} num_decodes {num_decodes}"
       )
+      num_prefill += 1
+      log.info(f"Total num prefill: {num_prefill}")
       slot = empty_slots.pop()
-      first_token = prefill(slot, row.tokens, row.true_length)
-      self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
+      #directly prefill prompts with 64 or less tokens
+      if num_tokens == 64:
+        first_token, slot, row = prefill([(slot, row)], 64)[0]
+        self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
+        continue
+      self.prefill_buckets[num_tokens].append((slot, row))
+      prefill_buckets_len = {k: len(self.prefill_buckets[k]) for k in self.prefill_buckets}
+      log.info(f"prefill buckets {prefill_buckets_len}")
+      if len(self.prefill_buckets[num_tokens]) * num_tokens == 1024:
+        prefill_results = prefill(self.prefill_buckets[num_tokens], num_tokens)
+        for (first_token, slot, row) in prefill_results:
+          log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} to detokenize backlog")
+          self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
+        self.prefill_buckets[num_tokens] = []
 
+    for num_tokens in self.prefill_buckets.keys():
+      prefill_results = prefill(self.prefill_buckets[num_tokens], num_tokens)
+      for (first_token, slot, row) in prefill_results:
+        log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} to detokenize backlog")
+        self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
+    self.prefill_buckets = defaultdict(list)
     while slot_to_id:
       log.info(f"decode-{desc}-{num_decodes} num_filled_slots {len(slot_to_id)}")
       num_decodes += 1
