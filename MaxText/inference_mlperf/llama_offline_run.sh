@@ -90,7 +90,7 @@ export API_URL=0.0.0.0:9000
 if "$test_run"; then
   export DATASET_TYPE=test
   export DATASET_PATH=${DATA_DISK_DIR}/processed-data.pkl
-  export TOTAL_SAMPLE_COUNT=100
+  export TOTAL_SAMPLE_COUNT=1000
   export USER_CONFIG=user${TOTAL_SAMPLE_COUNT}.conf
 else
   export DATASET_TYPE=full

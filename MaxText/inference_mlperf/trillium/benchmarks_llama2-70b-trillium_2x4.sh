@@ -104,7 +104,7 @@ run_benchmark() {
     local type=$1
     case "$type" in
         "performance")
-            $cmd bash llama_offline_run.sh -r benchmarks_performance_${RUN_DESC} ${RUN_OPTIONS}
+            $cmd bash llama_offline_run.sh ${RUN_OPTIONS} -r benchmarks_performance_${RUN_DESC}
             ;;
         "audit")
             $cmd bash llama_offline_run.sh -r benchmarks_audit_${RUN_DESC} -d
