@@ -80,30 +80,30 @@ class OfflineInference:
 
   def warmup(self, max_length, warmup_samples):
     self.init_decode_state()
-    # interesting_buckets = [
-    #     64,
-    #     128,
-    #     256,
-    #     512,
-    #     1024,
-    #     2048,
-    #     4096,
-    # ]
-    # for length in interesting_buckets:
-    #   if length > max_length:
-    #     break
-    #   log.info(f"Compiling prefill: {length}")
-    #   input_data = jax.ShapeDtypeStruct((length,), jnp.dtype("int32"))
-    #   self._cached_pref[length] = (
-    #     jax.jit(self._prefill_insert, donate_argnums=(4,))
-    #     .lower(
-    #       self.params, 
-    #       tokens=input_data, 
-    #       slot=0, 
-    #       true_length=length - 1, 
-    #       decode_state=self.decode_state)
-    #     .compile()
-    #   )
+    interesting_buckets = [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+    ]
+    for length in interesting_buckets:
+      if length > max_length:
+        break
+      log.info(f"Compiling prefill: {length}")
+      input_data = jax.ShapeDtypeStruct((length,), jnp.dtype("int32"))
+      self._cached_pref[length] = (
+        jax.jit(self._prefill_insert, donate_argnums=(4,))
+        .lower(
+          self.params, 
+          tokens=input_data, 
+          slot=0, 
+          true_length=length - 1, 
+          decode_state=self.decode_state)
+        .compile()
+      )
     #   input_data_batch = jax.ShapeDtypeStruct((max_length,), jnp.dtype("int32"))
     #   example_seq_len=16
     #   num_prompts = max_length//length
@@ -201,8 +201,8 @@ class OfflineInference:
         return prefill_result
       else:
         prefill_fn = self._prefill_insert_batch
-        # if (cached := self._cached_pref_batch.get(prefill_len)) is not None:
-        #   prefill_fn = cached
+        if (cached := self._cached_pref_batch.get(prefill_len)) is not None:
+          prefill_fn = cached
         positions = np.concatenate([np.arange(0, row.tokens.shape[0]) for (slot, row) in prefill_bucket])
         positions = jnp.array(positions)
 
@@ -350,14 +350,14 @@ class OfflineInference:
       if len(self.prefill_buckets[num_tokens]) * num_tokens == 1024:
         prefill_results = prefill(self.prefill_buckets[num_tokens], num_tokens)
         for (first_token, slot, row) in prefill_results:
-          log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} to detokenize backlog")
+          log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} slot {slot} to detokenize backlog")
           self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
         self.prefill_buckets[num_tokens] = []
 
     for num_tokens in self.prefill_buckets.keys():
       prefill_results = prefill(self.prefill_buckets[num_tokens], num_tokens)
       for (first_token, slot, row) in prefill_results:
-        log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} to detokenize backlog")
+        log.info(f"Put row of len {row.tokens.shape[0]} true length {row.true_length} slot {slot} to detokenize backlog")
         self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
     self.prefill_buckets = defaultdict(list)
     while slot_to_id:

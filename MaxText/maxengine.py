@@ -488,7 +488,7 @@ class MaxEngine(engine_api.Engine):
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
 
     unboxed_prefix["cache"] = self._maybe_unstack_prefill_result_cache(unboxed_prefix["cache"])
-
+    # jax.debug.print("Inserting cache slot {} start_idx {} seq_len {}", slot, start_idx, seq_len)
     # example = unboxed_prefix["cache"]["decoder"]['layers_0']['self_attention']['AttentionOp_0']
     # for key in example.keys():
     #   jax.debug.print("{} shape: {}", key, example[key].shape)
@@ -549,7 +549,7 @@ class MaxEngine(engine_api.Engine):
         slice_size = list(partial_cache.shape)
         slice_size[seqlen_index] = seq_len
 
-        slice_size = tuple(slice_size)
+        slice_size = tuple(slice_size) 
         partial_cache = jax.lax.dynamic_slice(
           partial_cache, 
           start_indices,
