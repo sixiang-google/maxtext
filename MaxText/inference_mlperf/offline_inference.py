@@ -52,7 +52,7 @@ class JetThread(threading.Thread):
 
 class OfflineInference:
 
-  def __init__(self, engine: engine_api.Engine, params, base_engine: engine_api.Engine):
+  def __init__(self, engine: engine_api.Engine, params, base_engine: engine_api.Engine, enable_batch_prefill: bool):
     self.live = False
     self.engine = engine
     self.decode_state = None
@@ -63,6 +63,7 @@ class OfflineInference:
       set_engine_vars_from_base_engine(engine, base_engine, rng)
     self.params = params
 
+    self.enable_batch_prefill = enable_batch_prefill
     self.batch_size = engine.max_concurrent_decodes
     self.max_decode_length = engine.config.max_target_length - engine.config.max_prefill_predict_length
     metadata = engine.get_tokenizer()
@@ -108,7 +109,7 @@ class OfflineInference:
     #   example_seq_len=16
     #   num_prompts = max_length//length
     #   self._cached_pref_batch[length] = (
-    #     jax.jit(self._prefill_insert_batch, donate_argnums=(4,), s)
+    #     jax.jit(self._prefill_insert_batch, donate_argnums=(4,))
     #     .lower(
     #       self.params, 
     #       tokens=input_data_batch, 
@@ -184,7 +185,7 @@ class OfflineInference:
       if self.dummy:
         log.info("dummy prefill")
         return 123
-      if prefill_len * len(prefill_bucket) != 1024:
+      if not self.enable_batch_prefill or prefill_len * len(prefill_bucket) != 1024:
         prefill_result = []
         prefill_fn = self._prefill_insert
         if (cached := self._cached_pref.get(prefill_len)) is not None:
@@ -210,7 +211,8 @@ class OfflineInference:
         for idx, (slot, row) in enumerate(prefill_bucket):
           zero_to_n = np.arange(0, row.tokens.shape[0])
           ones_to_keep = zero_to_n < row.true_length
-          one_d_output = ones_to_keep * (idx + 1)
+          one_d_output = (zero_to_n < row.true_length).astype(int) * (idx * 2 + 1) + \
+                         (zero_to_n >= row.true_length).astype(int) * (idx + 1) * 2
           sequence_indicators.append(one_d_output)
         sequence_indicator = jnp.array(np.concatenate(sequence_indicators))
 

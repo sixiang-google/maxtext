@@ -180,11 +180,6 @@ class AttentionOp(nn.Module):
     elif decoder_segment_ids is not None:
       mask = decoder_segment_ids[:, :, None] == decoder_segment_ids[:, None, :]
       mask = mask[:, None, None, :, :]
-      zero_segment_ids = decoder_segment_ids == 0
-      zero_mask = jnp.outer(zero_segment_ids[:, :, None], zero_segment_ids[:, None, :])
-      zero_mask = jnp.expand_dims(zero_mask, 0)
-      zero_mask = jnp.logical_not(zero_mask)[:, None, None, :, :]
-      mask = jnp.logical_and(mask, zero_mask)
 
     causal_mask = None
     # We enforce causality except for AUTOREGRESSION

@@ -528,6 +528,7 @@ class MaxEngine(engine_api.Engine):
           (0, start_idx), 
           (1, seq_len)
         )
+        partial_cache = jnp.mod(partial_cache, 2)
         full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
         return full_cache
       elif path_key == "cached_ar_lengths":

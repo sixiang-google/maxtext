@@ -11,6 +11,7 @@ dry_run=false
 skip_warmup=false
 test_run=false
 enable_profiler=false
+enable_batch_prefill=false
 performance=true
 audit=false
 accuracy=false
@@ -22,6 +23,7 @@ for arg in "$@"; do
     -t) test_run=true ;;
     -s) skip_warmup=true ;;
     -p) enable_profiler=true ;;
+    -c) enable_batch_prefill=true ;;
     -d) audit=true ;;
     -a) accuracy=true ;;
     -f) fast_eval=true ;;
@@ -49,6 +51,11 @@ fi
 PROFILER_OPTION=""
 if "$enable_profiler"; then
     PROFILER_OPTION="--enable_profile"
+fi
+
+BATCH_PREFILL_OPTION=""
+if "$enable_batch_prefill"; then
+    BATCH_PREFILL_OPTION="--enable_batch_prefill"
 fi
 
 if [ -z "$TOKENIZER_PATH" ]; then
@@ -131,7 +138,7 @@ run_loadgen() {
     --maxengine_args "${MAXENGINE_ARGS}" \
     --output_log_dir ${OUTPUT_LOG_DIR} \
     --tok_outlen_multiplier ${TOK_OUTLEN_MULTIPLIER} \
-    ${SKIP_WARMUP_OPTION} ${PROFILER_OPTION} 2>&1 | tee ${OUTPUT_LOG_DIR}/${LOADGEN_RUN_TYPE}_log.log
+    ${SKIP_WARMUP_OPTION} ${PROFILER_OPTION} ${BATCH_PREFILL_OPTION} 2>&1 | tee ${OUTPUT_LOG_DIR}/${LOADGEN_RUN_TYPE}_log.log
 }
 
 run_loadgen_performance () {
