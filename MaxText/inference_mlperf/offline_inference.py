@@ -134,14 +134,14 @@ class OfflineInference:
     """return decodestate."""
     padded_len = tokens.shape[0]
     prefill_result, first_token = self.engine.prefill(params=params, padded_tokens=tokens, true_length=true_length)
-    decode_state = self.engine.insert(prefill_result, decode_state, slot=slot, start_idx=0, seq_len=padded_len)
+    decode_state = self.engine.insert(prefill_result, decode_state, slot)
     return first_token, decode_state
   def _prefill_insert_batch(self, params, tokens, slots, num_prompts, 
                             decoder_positions, decoder_segment_ids, 
                             start_pos, padded_lengths, true_lengths,
                             decode_state):
     """return decodestate."""
-    prefill_results, first_tokens = self.engine.prefill_concat(
+    cache, prefill_results, first_tokens = self.engine.prefill_concat(
       params = params, 
       padded_tokens = tokens, 
       decoder_positions = decoder_positions, 
@@ -160,10 +160,11 @@ class OfflineInference:
     #   decode_state
     # )
     for i in range(num_prompts):
-      decode_state = self.engine.insert(
+      decode_state = self.engine.insert_partial(
         prefill_results[i],
         decode_state,
-        slot = slots[i], 
+        cache, 
+        slots[i], 
         start_idx = start_pos[i].item(),
         seq_len = padded_lengths[i].item()
       )
@@ -228,10 +229,10 @@ class OfflineInference:
           if len(array_to_pad) < pad_len:
             array_to_pad.extend([0] * (pad_len - len(array_to_pad)))
           return jnp.array(array_to_pad)
-        slots = pad_num_prompts_len_array(slots, 16)
-        padded_lengths = pad_num_prompts_len_array(padded_lengths, 16)
-        true_lengths = pad_num_prompts_len_array(true_lengths, 16)
-        start_pos = pad_num_prompts_len_array(start_pos, 16)
+        slots = pad_num_prompts_len_array(slots, 8)
+        padded_lengths = pad_num_prompts_len_array(padded_lengths, 8)
+        true_lengths = pad_num_prompts_len_array(true_lengths, 8)
+        start_pos = pad_num_prompts_len_array(start_pos, 8)
         
         first_tokens, self.decode_state = prefill_fn(
           self.params, 
@@ -301,7 +302,7 @@ class OfflineInference:
           if not should_terminate:
             slot_to_id[_slot] = row_id
           else:
-            empty_slots.append(slot)
+            empty_slots.append(_slot)
           continue
         for slot, id_ in slot_to_id.items():
           token, is_valid, length = result_tokens.data[slot]
@@ -342,8 +343,8 @@ class OfflineInference:
       log.info(f"Total num prefill: {num_prefill}")
       slot = empty_slots.pop()
       #directly prefill prompts with 64 or less tokens
-      if num_tokens == 64:
-        first_token, slot, row = prefill([(slot, row)], 64)[0]
+      if num_tokens in (64, 1024) or not self.enable_batch_prefill:
+        first_token, slot, row = prefill([(slot, row)], num_tokens)[0]
         self.detokenize_backlog.put((first_token, True, row.id, slot), block = True)
         continue
       self.prefill_buckets[num_tokens].append((slot, row))

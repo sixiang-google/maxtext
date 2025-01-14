@@ -177,7 +177,7 @@ class AttentionOp(nn.Module):
     mask = None
     if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
       mask = decoder_segment_ids[:, None, None, None, :] == common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR
-    elif decoder_segment_ids is not None:
+    elif decoder_segment_ids is not None and model_mode == common_types.MODEL_MODE_PREFILL:
       mask = decoder_segment_ids[:, :, None] == decoder_segment_ids[:, None, :]
       mask = mask[:, None, None, :, :]
 

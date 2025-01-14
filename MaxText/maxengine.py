@@ -392,7 +392,6 @@ class MaxEngine(engine_api.Engine):
       )
       return {
           "logits": selected_logits,
-          "cache": cache,
           "next_pos": next_pos,
           "generated_tokens": generated_tokens,
           "tokens": first_generated_token,
@@ -403,7 +402,7 @@ class MaxEngine(engine_api.Engine):
       prefill_result, first_token = process_packed_logits_and_caches(flat_logits, vars, idx)
       prefill_results.append(prefill_result)
       first_tokens.append(first_token)
-    return prefill_results, first_tokens
+    return cache, prefill_results, first_tokens
   @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(2,))
   def generate(
       self,
@@ -467,27 +466,125 @@ class MaxEngine(engine_api.Engine):
     }, result
 
   @functools.partial(
+    jax.jit,
+    static_argnums=(0,),
+    donate_argnums=(
+        1,
+        2,
+    ),
+  )
+  def insert(
+      self,
+      prefix: Prefix,
+      decode_state: DecodeState,
+      slot: int,
+  ) -> DecodeState:
+    """Insert into KV cache"""
+    unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
+
+    unboxed_prefix["cache"] = self._maybe_unstack_prefill_result_cache(unboxed_prefix["cache"])
+
+    def copy(path, partial_cache, full_cache, annotations):
+      path_key = path[-1].key
+      if path_key in [
+          "cache_ar_index",
+          "cached_ar_key",
+          "cached_ar_value",
+          "cached_ar_key_scale",
+          "cached_ar_value_scale",
+      ]:
+        return full_cache  # we don't even zero these out because we can mask them out.
+
+      batch_idx = -1
+      if "cache_batch" in annotations:
+        batch_idx = annotations.index("cache_batch")
+      elif "cache_scale_batch" in annotations:
+        batch_idx = annotations.index("cache_scale_batch")
+
+      if batch_idx < 0:
+        raise ValueError(f"Batch index {batch_idx=} shouldn't be less than zero for {path_key}, got {annotations=}")
+
+      if path_key == "cache_ar_segment_id":
+        ### goal: zero this out in case there is existing data
+        s = list(full_cache.shape)
+        s[batch_idx] = 1
+        zeros = jnp.zeros(tuple(s), dtype=jnp.int32)
+        return jax.lax.dynamic_update_index_in_dim(full_cache, zeros, slot, batch_idx)
+      elif path_key == "cache_prefill_segment_id":
+        s = list(full_cache.shape)
+        s[batch_idx] = 1
+        zeros = jnp.zeros(tuple(s), dtype=jnp.int32)
+        ## zero out in case prefill cache is too small to cover
+        full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, zeros, slot, batch_idx)
+        ## copy prefill cachce
+        full_cache = jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
+        return full_cache
+      elif path_key == "cached_ar_lengths":
+        return full_cache.at[slot].set(0)
+      elif path_key in [
+          "cached_prefill_key",
+          "cached_prefill_value",
+          "cached_prefill_key_scale",
+          "cached_prefill_value_scale",
+      ]:
+        return jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
+      else:
+        raise ValueError(f"We don't have a strategy for inserting {path_key}")
+
+    inserted_cache = jax.tree_util.tree_map_with_path(
+        copy,
+        unboxed_prefix["cache"],
+        decode_state["cache"],
+        self.kv_cache_annotations_named,
+    )
+    inserted_logits = jax.lax.dynamic_update_index_in_dim(decode_state["logits"], unboxed_prefix["logits"], slot, 0)
+    inserted_next_pos = jax.lax.dynamic_update_index_in_dim(decode_state["next_pos"], unboxed_prefix["next_pos"], slot, 0)
+    inserted_generated_tokens = jax.lax.dynamic_update_index_in_dim(
+        decode_state["generated_tokens"],
+        unboxed_prefix["generated_tokens"],
+        slot,
+        0,
+    )
+    inserted_tokens = jax.lax.dynamic_update_index_in_dim(decode_state["tokens"], unboxed_prefix["tokens"], slot, 0)
+
+    inserted_logits = jax.lax.with_sharding_constraint(inserted_logits, self.replicated_sharding)
+    inserted_generated_tokens = jax.lax.with_sharding_constraint(inserted_generated_tokens, self.replicated_sharding)
+    inserted_next_pos = jax.lax.with_sharding_constraint(inserted_next_pos, self.replicated_sharding)
+    inserted_tokens = jax.lax.with_sharding_constraint(inserted_tokens, self.replicated_sharding)
+    inserted_cache = jax.lax.with_sharding_constraint(inserted_cache, self.kv_cache_shardings)
+
+    return {
+        "logits": inserted_logits,
+        "cache": inserted_cache,
+        "next_pos": inserted_next_pos,
+        "generated_tokens": inserted_generated_tokens,
+        "tokens": inserted_tokens,
+    }
+
+
+  @functools.partial(
       jax.jit,
-      static_argnums=(0,),
+      static_argnums=(0, ),
       static_argnames=("seq_len", ),
       donate_argnums=(
           1,
           2,
       ),
   )
-  def insert(
+  def insert_partial(
       self,
       prefix: Prefix,
       decode_state: DecodeState,
+      cache: Any,
+      slot: int, 
       *,
-      slot: int,
       start_idx: int, 
       seq_len: int,
   ) -> DecodeState:
     """Insert into KV cache"""
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
-
-    unboxed_prefix["cache"] = self._maybe_unstack_prefill_result_cache(unboxed_prefix["cache"])
+    cache_unboxed = max_utils.unbox_logicallypartioned(cache)
+    cache_unboxed = self._maybe_unstack_prefill_result_cache(cache_unboxed)
     # jax.debug.print("Inserting cache slot {} start_idx {} seq_len {}", slot, start_idx, seq_len)
     # example = unboxed_prefix["cache"]["decoder"]['layers_0']['self_attention']['AttentionOp_0']
     # for key in example.keys():
@@ -564,7 +661,7 @@ class MaxEngine(engine_api.Engine):
 
     inserted_cache = jax.tree_util.tree_map_with_path(
         copy,
-        unboxed_prefix["cache"],
+        cache_unboxed,
         decode_state["cache"],
         self.kv_cache_annotations_named,
     )
