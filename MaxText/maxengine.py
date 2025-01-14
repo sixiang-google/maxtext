@@ -16,6 +16,7 @@
 import copy as cp
 import functools
 from typing import Any, Optional, Tuple, Callable
+from collections import defaultdict
 
 import flax
 from flax import linen as nn
@@ -325,7 +326,7 @@ class MaxEngine(engine_api.Engine):
       num_prompts: int, 
       sampler: Optional[Callable[[Any], Any]] = None,  # pylint: disable=unused-argument
       rng: Optional[jax.random.PRNGKey] = None,
-  ) -> Tuple[PackedPrefix, engine_api.ResultTokens]:
+  ) -> Tuple[Any, PackedPrefix, engine_api.ResultTokens]:
     """Computes a kv-cache for a new generate request.
 
     Args:
@@ -396,13 +397,16 @@ class MaxEngine(engine_api.Engine):
           "generated_tokens": generated_tokens,
           "tokens": first_generated_token,
       }, result
-    prefill_results = []
+    prefill_results = defaultdict(list)
     first_tokens = []
     for idx in range(num_prompts):
       prefill_result, first_token = process_packed_logits_and_caches(flat_logits, vars, idx)
-      prefill_results.append(prefill_result)
+      for k, v in prefill_result.items():
+        prefill_results[k].append(v)
       first_tokens.append(first_token)
+    prefill_results = {k: jnp.stack(v) for k, v in prefill_results.items()}
     return cache, prefill_results, first_tokens
+
   @functools.partial(jax.jit, static_argnums=(0,), donate_argnums=(2,))
   def generate(
       self,
@@ -565,7 +569,7 @@ class MaxEngine(engine_api.Engine):
   @functools.partial(
       jax.jit,
       static_argnums=(0, ),
-      static_argnames=("seq_len", ),
+      static_argnames=("num_prompts", "seq_len", ),
       donate_argnums=(
           1,
           2,
@@ -573,24 +577,21 @@ class MaxEngine(engine_api.Engine):
   )
   def insert_partial(
       self,
-      prefix: Prefix,
+      prefix: PackedPrefix,
       decode_state: DecodeState,
       cache: Any,
-      slot: int, 
+      slots: jax.Array, 
       *,
-      start_idx: int, 
+      start_indices: jax.Array, 
+      num_prompts: int, 
       seq_len: int,
   ) -> DecodeState:
     """Insert into KV cache"""
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
     cache_unboxed = max_utils.unbox_logicallypartioned(cache)
     cache_unboxed = self._maybe_unstack_prefill_result_cache(cache_unboxed)
-    # jax.debug.print("Inserting cache slot {} start_idx {} seq_len {}", slot, start_idx, seq_len)
-    # example = unboxed_prefix["cache"]["decoder"]['layers_0']['self_attention']['AttentionOp_0']
-    # for key in example.keys():
-    #   jax.debug.print("{} shape: {}", key, example[key].shape)
-    # jax.debug.print("-----------------------------")
-    # jax.debug.print(self.config.prefill_cache_axis_order)
+    start_idx = 0
+    slot = slots[0]
     def copy(path, partial_cache, full_cache, annotations):
       path_key = path[-1].key
       if path_key in [
@@ -637,13 +638,8 @@ class MaxEngine(engine_api.Engine):
           "cached_prefill_value_scale",
       ]:
         seqlen_index = self.config.prefill_cache_axis_order.split(",").index('1')
-        start_indices = jnp.zeros(4, dtype=int)
-        start_indices = jax.lax.dynamic_update_slice(
-          start_indices, 
-          jnp.array(start_idx, dtype=int, ndmin = 1), 
-          (seqlen_index, )
-        )
-        # start_indices[seqlen_index] = start_idx
+        start_indices = [0, 0, 0, 0]
+        start_indices[seqlen_index] = start_idx
         slice_size = list(partial_cache.shape)
         slice_size[seqlen_index] = seq_len
 
@@ -658,22 +654,30 @@ class MaxEngine(engine_api.Engine):
         return jax.lax.dynamic_update_index_in_dim(full_cache, partial_cache, slot, batch_idx)
       else:
         raise ValueError(f"We don't have a strategy for inserting {path_key}")
+    inserted_cache = decode_state["cache"]
+    inserted_logits = decode_state["logits"]
+    inserted_next_pos = decode_state["next_pos"]
+    inserted_generated_tokens = decode_state["generated_tokens"]
+    inserted_tokens = decode_state["tokens"]
 
-    inserted_cache = jax.tree_util.tree_map_with_path(
-        copy,
-        cache_unboxed,
-        decode_state["cache"],
-        self.kv_cache_annotations_named,
-    )
-    inserted_logits = jax.lax.dynamic_update_index_in_dim(decode_state["logits"], unboxed_prefix["logits"], slot, 0)
-    inserted_next_pos = jax.lax.dynamic_update_index_in_dim(decode_state["next_pos"], unboxed_prefix["next_pos"], slot, 0)
-    inserted_generated_tokens = jax.lax.dynamic_update_index_in_dim(
-        decode_state["generated_tokens"],
-        unboxed_prefix["generated_tokens"],
-        slot,
-        0,
-    )
-    inserted_tokens = jax.lax.dynamic_update_index_in_dim(decode_state["tokens"], unboxed_prefix["tokens"], slot, 0)
+    for i in range(num_prompts):
+      start_idx = start_indices[i]
+      slot = slots[i]
+      inserted_cache = jax.tree_util.tree_map_with_path(
+          copy,
+          cache_unboxed,
+          inserted_cache,
+          self.kv_cache_annotations_named
+      )
+      inserted_logits = jax.lax.dynamic_update_index_in_dim(inserted_logits, unboxed_prefix["logits"][i, ...], slot, 0)
+      inserted_next_pos = jax.lax.dynamic_update_index_in_dim(inserted_next_pos, unboxed_prefix["next_pos"][i, ...], slot, 0)
+      inserted_generated_tokens = jax.lax.dynamic_update_index_in_dim(
+          inserted_generated_tokens,
+          unboxed_prefix["generated_tokens"][i, ...],
+          slot,
+          0,
+      )
+      inserted_tokens = jax.lax.dynamic_update_index_in_dim(inserted_tokens, unboxed_prefix["tokens"][i,...], slot, 0)
 
     inserted_logits = jax.lax.with_sharding_constraint(inserted_logits, self.replicated_sharding)
     inserted_generated_tokens = jax.lax.with_sharding_constraint(inserted_generated_tokens, self.replicated_sharding)
